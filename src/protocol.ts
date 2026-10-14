@@ -11,6 +11,7 @@ import { URL } from "node:url";
 import path from "node:path";
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
 
 const LEGACY_PROTOCOL = "element";
 const SEARCH_PARAM = "element-desktop-ssoid";
@@ -36,6 +37,14 @@ export default class ProtocolHandler {
             // special handler for running without being packaged, e.g `electron .` by passing our app path to electron
             app.setAsDefaultProtocolClient(this.protocol, process.execPath, [app.getAppPath(), ...args]);
             app.setAsDefaultProtocolClient(LEGACY_PROTOCOL, process.execPath, [app.getAppPath(), ...args]);
+        }
+
+        if (process.platform === "linux") {
+            // app.setAsDefaultProtocolClient() is a no-op on Linux: handler registration happens via a
+            // .desktop file with the appropriate MimeType, which only system packages (deb/rpm) install.
+            // AppImages and unpackaged runs register nothing, which leaves deep links (notably the SSO
+            // login callback) dead in the browser, so install a user-level desktop entry ourselves.
+            void this.ensureLinuxProtocolRegistration(args);
         }
 
         if (process.platform === "darwin") {
@@ -65,6 +74,79 @@ export default class ProtocolHandler {
             sessionId: this.sessionId,
         };
     };
+
+    private static async exec(command: string, args: string[]): Promise<string> {
+        return new Promise((resolve, reject) => {
+            execFile(command, args, { encoding: "utf8" }, (error, stdout) => {
+                if (error) reject(error);
+                else resolve(stdout.trim());
+            });
+        });
+    }
+
+    // Escape a token for use in the Exec field of a desktop entry
+    private static desktopEntryEscape(part: string): string {
+        return `"${part.replace(/["\\]/g, "\\$&")}"`;
+    }
+
+    private async ensureLinuxProtocolRegistration(args: string[]): Promise<void> {
+        const desktopFileName = "element-desktop-user-handler.desktop";
+        const schemes = [this.protocol, LEGACY_PROTOCOL];
+        try {
+            // If something else (e.g. a system package) is already the default handler, leave it alone
+            const defaults = await Promise.all(
+                schemes.map((scheme) =>
+                    ProtocolHandler.exec("xdg-mime", ["query", "default", `x-scheme-handler/${scheme}`]).catch(
+                        () => "",
+                    ),
+                ),
+            );
+            if (defaults.every((d) => d && d !== desktopFileName)) return;
+
+            // For AppImages, process.execPath points at the volatile mount point, so use $APPIMAGE instead
+            const executable = process.env.APPIMAGE ?? process.execPath;
+            const execParts = [ProtocolHandler.desktopEntryEscape(executable)];
+            if (!app.isPackaged) {
+                // unpackaged runs (`electron .`) need the app path so the right app is opened
+                execParts.push(ProtocolHandler.desktopEntryEscape(app.getAppPath()));
+            }
+            for (const arg of args) execParts.push(ProtocolHandler.desktopEntryEscape(arg));
+            execParts.push("%u");
+
+            const applicationsDir = path.join(app.getPath("home"), ".local", "share", "applications");
+            const desktopFilePath = path.join(applicationsDir, desktopFileName);
+            const contents = [
+                "[Desktop Entry]",
+                "Type=Application",
+                "Name=Element URL Handler",
+                "NoDisplay=true",
+                "Terminal=false",
+                "Categories=Network;InstantMessaging;",
+                `Exec=${execParts.join(" ")}`,
+                `MimeType=${schemes.map((scheme) => `x-scheme-handler/${scheme}`).join(";")};`,
+                "",
+            ].join("\n");
+
+            fs.mkdirSync(applicationsDir, { recursive: true });
+            // avoid churn if nothing changed
+            if (!fs.existsSync(desktopFilePath) || fs.readFileSync(desktopFilePath, "utf8") !== contents) {
+                fs.writeFileSync(desktopFilePath, contents, { encoding: "utf8" });
+                await ProtocolHandler.exec("update-desktop-database", [applicationsDir]).catch(() => {});
+            }
+
+            // xdg-mime fails to write mimeapps.list if ~/.config is missing (e.g. fresh user profiles)
+            fs.mkdirSync(path.join(app.getPath("home"), ".config"), { recursive: true });
+
+            for (const [i, scheme] of schemes.entries()) {
+                if (!defaults[i] || defaults[i] === desktopFileName) {
+                    await ProtocolHandler.exec("xdg-mime", ["default", desktopFileName, `x-scheme-handler/${scheme}`]);
+                }
+            }
+            console.log("Registered Linux protocol handler for schemes:", schemes.join(", "));
+        } catch (e) {
+            console.log("Failed to register Linux protocol handler:", e);
+        }
+    }
 
     private processUrl(url: string): void {
         if (!global.mainWindow) return;
